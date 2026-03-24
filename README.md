@@ -18,6 +18,6 @@
 
 > `rclone move`
 
-> [rcmv docs](https://github.com/whonixnetworks/rcm-x/rcmv/README.md)
+> [rcmv docs](rcmv/README.md)
 
 - Uses `rclone move` to upload local files to a remote. 
