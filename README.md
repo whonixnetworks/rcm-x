@@ -10,6 +10,8 @@
 
 > `rclone mount`
 
+> [rcmnt docs](rcmnt/README.md)
+
 - Mounts a `rclone` remote to local file system
 
 ----
