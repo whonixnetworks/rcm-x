@@ -273,7 +273,10 @@ rcmx_config() {
         dim "Apps, Docker containers, and Jellyfin should point here."
         read_dir "Full path" "${USER_HOME}/merged" MERGED_DIR
 
-        RCMX_HIDDEN_BASE="${MERGED_DIR}/.rcmx-${INSTANCE_NAME}"
+        # Backing dirs must live OUTSIDE MERGED_DIR to avoid a FUSE deadlock:
+        # if local/ and remote/ are inside the mergerfs mount point, any access
+        # to them goes through FUSE which then tries to read from itself → hang.
+        RCMX_HIDDEN_BASE="${USER_HOME}/.local/share/rcmx/${INSTANCE_NAME}"
         LOCAL_DIR="${RCMX_HIDDEN_BASE}/local"
         REMOTE_MOUNT_DIR="${RCMX_HIDDEN_BASE}/remote"
 
@@ -409,6 +412,23 @@ get_user_ids() {
 check_mount_conflicts() {
   section "Checking Mount Conflicts"
   
+  # In merged-only mode, verify the backing dirs are NOT inside MERGED_DIR.
+  # If they were, mergerfs would shadow them causing a FUSE deadlock where
+  # any ls/stat on the mount hangs the process indefinitely.
+  if [[ "$MERGED_ONLY" == "true" ]]; then
+    local real_merged real_local real_remote
+    real_merged=$(realpath -m "$MERGED_DIR")
+    real_local=$(realpath -m "$LOCAL_DIR")
+    real_remote=$(realpath -m "$REMOTE_MOUNT_DIR")
+    if [[ "$real_local" == "$real_merged"/* || "$real_remote" == "$real_merged"/* ]]; then
+      error "Backing directories are inside the merged mount point."
+      error "  Merged : $real_merged"
+      error "  Local  : $real_local"
+      error "  Remote : $real_remote"
+      die "This would cause a FUSE deadlock. Please re-run setup — this is a bug, report it."
+    fi
+  fi
+
   # Check if merged directory or its parents/children are already mounted
   if mountpoint_with_timeout "$MERGED_DIR" 3; then
     warn "Directory $MERGED_DIR is already a mount point"
@@ -455,6 +475,11 @@ create_dirs() {
 
   local dirs=("$MERGED_DIR" "$LOCAL_DIR" "$REMOTE_MOUNT_DIR" "$LOG_DIR")
 
+  # In merged-only mode, also ensure the hidden backing base dir exists
+  if [[ "$MERGED_ONLY" == "true" ]] && [[ -n "$RCMX_HIDDEN_BASE" ]]; then
+    dirs=("$MERGED_DIR" "$RCMX_HIDDEN_BASE" "$LOCAL_DIR" "$REMOTE_MOUNT_DIR" "$LOG_DIR")
+  fi
+
     for dir in "${dirs[@]}"; do
         if [[ -d "$dir" ]]; then
             success "Already exists: $dir"
@@ -464,13 +489,6 @@ create_dirs() {
         fi
         sudo_run "chown $dir" chown "${WHOAMI}:${WHOAMI}" "$dir"
     done
-
-    # In merged-only mode, secure the hidden backing dir but keep it accessible
-    # 755 allows the user to access it while preventing others from listing
-    if [[ "$MERGED_ONLY" == "true" ]] && [[ -n "$RCMX_HIDDEN_BASE" ]]; then
-        sudo_run "secure hidden dir" chmod 755 "$RCMX_HIDDEN_BASE"
-        success "Hidden backing dir secured (755): $RCMX_HIDDEN_BASE"
-    fi
 
     sudo_run "create log" touch "$RCLONE_LOG_FILE"
     sudo_run "chown log" chown "${WHOAMI}:${WHOAMI}" "$RCLONE_LOG_FILE"
@@ -542,12 +560,6 @@ write_mergerfs_service() {
 
     # Build mergerfs options
     local mergerfs_opts="defaults,allow_other,use_ino"
-    
-    # In merged-only mode, the merged directory contains the hidden .rcmx-* directory
-    # We need to allow mounting on non-empty directories
-    if [[ "$MERGED_ONLY" == "true" ]]; then
-      mergerfs_opts="${mergerfs_opts},nonempty"
-    fi
 
     cat > "$tmpfile" <<SVCEOF
 [Unit]
