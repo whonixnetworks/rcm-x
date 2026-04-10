@@ -1,0 +1,849 @@
+#!/usr/bin/env bash
+# rcmnt — Rclone mount manager with health checks, cache management, and monitoring
+# author: greedy
+# version: 1.4.0
+
+set -uo pipefail
+
+# ── Terminal Detection ──────────────────────────────────────────────────────────
+[[ -t 1 ]] && TERMINAL=true || TERMINAL=false
+
+# ── Configuration Defaults ──────────────────────────────────────────────────────
+REMOTE="GCrypt"
+REMOTE_PATH=""
+MOUNT_PATH="/home/greedy/crypt"
+LOG_FILE="$HOME/.rclone/mount.log"
+CACHE_DIR="$HOME/.cache/rclone/vfs/$REMOTE/$REMOTE_PATH"
+CONFIG_FILE="$HOME/.config/rclone/rclone-script.conf"
+MAX_RETRIES=5
+BWLIMIT=""
+
+# ── Colors ──────────────────────────────────────────────────────────────────────
+if $TERMINAL; then
+    RED='\033[0;31m'    GREEN='\033[0;32m'  YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'   CYAN='\033[0;36m'   MAGENTA='\033[0;35m'
+    WHITE='\033[1;37m'  GRAY='\033[0;90m'   BOLD='\033[1m'
+    DIM='\033[2m'       NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA=''
+    WHITE='' GRAY='' BOLD='' DIM='' NC=''
+fi
+
+# ── Logging ─────────────────────────────────────────────────────────────────────
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+die()         { log_error "FATAL: $1"; exit 1; }
+
+# ── UI Helpers ──────────────────────────────────────────────────────────────────
+show_header() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "${BLUE}   $1${NC}"
+    echo -e "${BLUE}========================================${NC}"
+    echo
+}
+
+show_section() { echo -e "${MAGENTA}=== $1 ===${NC}"; }
+
+box() {
+    local color="${1:-$MAGENTA}" title="$2"
+    echo -e "${color}╭─────────────────────────────────────╮${NC}"
+    printf "${color}│${NC}   ${BOLD}${color}%-33s${NC}${color}│${NC}\n" "$title"
+    echo -e "${color}╰─────────────────────────────────────╯${NC}"
+    echo
+}
+
+result_box() {
+    local ok="$1"  # true/false
+    local msg_ok="${2:-Success}" msg_fail="${3:-Failed}"
+    if [[ "$ok" == true ]]; then
+        echo -e "${BOLD}${GREEN}╭─────────────────────────────────────╮${NC}"
+        printf "${BOLD}${GREEN}│${NC}   ${GREEN}✓ %-32s${BOLD}${GREEN}│${NC}\n" "$msg_ok"
+        echo -e "${BOLD}${GREEN}╰─────────────────────────────────────╯${NC}"
+    else
+        echo -e "${BOLD}${RED}╭─────────────────────────────────────╮${NC}"
+        printf "${BOLD}${RED}│${NC}   ${RED}✗ %-32s${BOLD}${RED}│${NC}\n" "$msg_fail"
+        echo -e "${BOLD}${RED}╰─────────────────────────────────────╯${NC}"
+    fi
+}
+
+press_any_key() { echo -e "${DIM}Press any key to continue...${NC}"; read -r -s -n1; }
+
+# ── Configuration ───────────────────────────────────────────────────────────────
+load_config() {
+    [[ ! -f "$CONFIG_FILE" ]] && return 0
+    local line key value
+    while IFS= read -r line; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Only accept KEY="value" or KEY=value patterns for known keys
+        if [[ "$line" =~ ^(REMOTE|REMOTE_PATH|MOUNT_PATH|LOG_FILE|CACHE_DIR|MAX_RETRIES|BWLIMIT)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            # Strip surrounding quotes if present
+            value="${value%\"}"
+            value="${value#\"}"
+            printf -v "$key" '%s' "$value"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" << EOF
+# rcmnt Configuration — do not add executable code
+REMOTE="$REMOTE"
+REMOTE_PATH="$REMOTE_PATH"
+MOUNT_PATH="$MOUNT_PATH"
+LOG_FILE="$LOG_FILE"
+CACHE_DIR="$CACHE_DIR"
+MAX_RETRIES=$MAX_RETRIES
+BWLIMIT="$BWLIMIT"
+EOF
+    log_success "Configuration saved to $CONFIG_FILE"
+}
+
+# ── Mount Helpers ───────────────────────────────────────────────────────────────
+is_mounted() { mountpoint -q "$MOUNT_PATH" 2>/dev/null; }
+
+rclone_pid() { pgrep -f "rclone mount.*$MOUNT_PATH" | head -1; }
+
+fusermount_bin() {
+    if command -v fusermount3 &>/dev/null; then
+        echo fusermount3
+    elif command -v fusermount &>/dev/null; then
+        echo fusermount
+    fi
+}
+
+# ── Format Bytes ────────────────────────────────────────────────────────────────
+format_bytes() {
+    local -i bytes="${1:-0}"
+    if   (( bytes < 1024        )); then printf '%dB'    "$bytes"
+    elif (( bytes < 1048576     )); then printf '%dKB'   "$(( bytes / 1024 ))"
+    elif (( bytes < 1073741824  )); then printf '%dMB'   "$(( bytes / 1048576 ))"
+    else printf '%.2fGB' "$(bc -l <<< "scale=2; $bytes / 1073741824")"
+    fi
+}
+
+# ── Stale Mount Cleanup ─────────────────────────────────────────────────────────
+clean_stale_mount() {
+    local needs_cleanup=false stat_output fuse_bin
+
+    stat_output=$(stat "$MOUNT_PATH" 2>&1) || {
+        if grep -qiE "transport endpoint|stale file handle" <<< "$stat_output"; then
+            needs_cleanup=true
+        fi
+    }
+
+    if findmnt -n "$MOUNT_PATH" &>/dev/null || \
+       grep -q " $MOUNT_PATH fuse" /proc/mounts 2>/dev/null; then
+        needs_cleanup=true
+    fi
+
+    if ! is_mounted && [[ -n "$(rclone_pid)" ]]; then
+        needs_cleanup=true
+    fi
+
+    $needs_cleanup || return 0
+
+    echo -e "${YELLOW}⚠ Stale mount or orphaned process detected — cleaning up...${NC}"
+
+    if [[ -n "$(rclone_pid)" ]]; then
+        echo -ne "  ${DIM}Stopping orphaned rclone processes...${NC} "
+        pkill -f "rclone mount.*$MOUNT_PATH" 2>/dev/null; sleep 2
+        pkill -9 -f "rclone mount.*$MOUNT_PATH" 2>/dev/null; sleep 1
+        echo -e "${GREEN}✓${NC}"
+    fi
+
+    fuse_bin=$(fusermount_bin)
+    if findmnt -n "$MOUNT_PATH" &>/dev/null && [[ -n "$fuse_bin" ]]; then
+        echo -ne "  ${DIM}Unmounting stale filesystem...${NC} "
+        "$fuse_bin" -uz "$MOUNT_PATH" 2>/dev/null; sleep 1
+        if findmnt -n "$MOUNT_PATH" &>/dev/null; then
+            sudo umount -l "$MOUNT_PATH" 2>/dev/null; sleep 1
+        fi
+        echo -e "${GREEN}✓${NC}"
+    fi
+
+    if ! findmnt -n "$MOUNT_PATH" &>/dev/null && [[ -z "$(rclone_pid)" ]]; then
+        echo -e "${GREEN}✓ Stale mount cleaned${NC}"
+    else
+        echo -e "${RED}✗ Could not fully clean stale mount — manual intervention may be needed${NC}"
+        return 1
+    fi
+}
+
+# ── Health Check ────────────────────────────────────────────────────────────────
+check_health() {
+    if ! is_mounted; then
+        echo -e "${RED}✗ Mount is not active${NC}"
+        return 1
+    fi
+
+    box "$CYAN" "Performing Health Check"
+
+    local health_ok=true pid test_file
+
+    echo -ne "  ${DIM}Read access...${NC}            "
+    if timeout 5 ls "$MOUNT_PATH" &>/dev/null; then
+        echo -e "${GREEN}✓ PASS${NC}"
+    else
+        echo -e "${RED}✗ FAIL${NC}"; health_ok=false
+    fi
+
+    echo -ne "  ${DIM}Write access...${NC}           "
+    test_file="$MOUNT_PATH/.rclone_health_$$"
+    if touch "$test_file" 2>/dev/null; then
+        rm -f "$test_file"
+        echo -e "${GREEN}✓ PASS${NC}"
+    else
+        echo -e "${YELLOW}⚠ SKIP (read-only or no permission)${NC}"
+    fi
+
+    echo -ne "  ${DIM}Stale file handles...${NC}     "
+    if findmnt -T "$MOUNT_PATH" 2>/dev/null | grep -q "stale"; then
+        echo -e "${RED}✗ DETECTED${NC}"; health_ok=false
+    else
+        echo -e "${GREEN}✓ CLEAN${NC}"
+    fi
+
+    echo -ne "  ${DIM}Process status...${NC}         "
+    pid=$(rclone_pid)
+    if [[ -n "$pid" ]] && ps -p "$pid" &>/dev/null; then
+        echo -e "${GREEN}✓ RUNNING${NC} ${DIM}(PID $pid)${NC}"
+    else
+        echo -e "${RED}✗ NO PROCESS${NC}"; health_ok=false
+    fi
+
+    echo -ne "  ${DIM}Remote connectivity...${NC}    "
+    if timeout 10 rclone lsd "$REMOTE:" --max-depth 1 &>/dev/null; then
+        echo -e "${GREEN}✓ CONNECTED${NC}"
+    else
+        echo -e "${YELLOW}⚠ SLOW OR DISCONNECTED${NC}"
+    fi
+
+    echo
+    if $health_ok; then
+        result_box true "Mount is healthy"
+    else
+        result_box false "Mount has issues"
+        echo -e "${YELLOW}Try: rcmnt --restart${NC}"
+    fi
+
+    $health_ok
+}
+
+# ── Cache Management ────────────────────────────────────────────────────────────
+clean_cache() {
+    box "$MAGENTA" "Cleaning Rclone Cache"
+
+    if [[ ! -d "$CACHE_DIR" ]]; then
+        echo -e "${YELLOW}⚠ Cache directory not found: $CACHE_DIR${NC}"
+        return 0
+    fi
+
+    local old_size old_files deleted_dirs new_size new_files saved
+    old_size=$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
+    old_files=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l)
+    echo -e "  ${DIM}Before:${NC} ${WHITE}$(format_bytes "${old_size:-0}")${NC} ${DIM}($old_files files)${NC}"
+    echo
+
+    echo -ne "  ${DIM}Removing cache files older than 24h...${NC} "
+    local deleted_count
+    deleted_count=$(find "$CACHE_DIR" -type f -mtime +1 2>/dev/null | wc -l)
+    find "$CACHE_DIR" -type f -mtime +1 -delete 2>/dev/null
+    echo -e "${GREEN}✓ $deleted_count files${NC}"
+
+    echo -ne "  ${DIM}Removing empty directories...${NC}        "
+    deleted_dirs=$(find "$CACHE_DIR" -type d -empty 2>/dev/null | wc -l)
+    find "$CACHE_DIR" -type d -empty -delete 2>/dev/null
+    echo -e "${GREEN}✓ $deleted_dirs dirs${NC}"
+
+    new_size=$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
+    new_files=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l)
+    saved=$(( ${old_size:-0} - ${new_size:-0} ))
+
+    echo
+    echo -e "  ${DIM}After:${NC}  ${WHITE}$(format_bytes "${new_size:-0}")${NC} ${DIM}($new_files files)${NC}"
+    echo -e "  ${GREEN}Freed:  $(format_bytes "$saved")${NC}"
+}
+
+# ── Log Management ──────────────────────────────────────────────────────────────
+rotate_logs() {
+    local max_size=104857600 max_files=5  # 100MB
+
+    [[ ! -f "$LOG_FILE" ]] && return 0
+
+    local log_size
+    log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    (( log_size <= max_size )) && return 0
+
+    log_info "Rotating log files..."
+
+    local i
+    for (( i = max_files - 1; i >= 1; i-- )); do
+        [[ -f "${LOG_FILE}.${i}" ]] && mv "${LOG_FILE}.${i}" "${LOG_FILE}.$((i+1))"
+    done
+    rm -f "${LOG_FILE}.${max_files}"
+    mv "$LOG_FILE" "${LOG_FILE}.1"
+    touch "$LOG_FILE"
+
+    log_success "Logs rotated"
+    is_mounted && log_warning "Restart mount to use new log file"
+}
+
+view_logs() {
+    local mode="${1:-tail}" lines="${2:-50}"
+
+    if [[ ! -f "$LOG_FILE" ]]; then
+        log_error "Log file not found: $LOG_FILE"
+        return 1
+    fi
+
+    case "$mode" in
+        --tail|-t)   echo -e "${CYAN}Following log (Ctrl+C to exit)...${NC}"; tail -f -n "$lines" "$LOG_FILE" ;;
+        --errors|-e) echo -e "${CYAN}Errors and warnings:${NC}"; grep -iE "error|failed|panic|warn" "$LOG_FILE" | tail -n "$lines" ;;
+        --full)      less +G "$LOG_FILE" ;;
+        *)           tail -n "$lines" "$LOG_FILE" ;;
+    esac
+}
+
+# ── Bandwidth Control ───────────────────────────────────────────────────────────
+set_bandwidth() {
+    if [[ $# -eq 0 ]]; then
+        echo -e "${CYAN}Current bandwidth limit:${NC} ${WHITE}${BWLIMIT:-unlimited}${NC}"
+        echo
+        echo "Usage: rcmnt --bwlimit <speed>"
+        echo "  rcmnt --bwlimit 10M    # 10 MB/s"
+        echo "  rcmnt --bwlimit 512K   # 512 KB/s"
+        echo "  rcmnt --bwlimit off    # No limit"
+        return 0
+    fi
+
+    local new_limit="$1"
+    if [[ "$new_limit" == "off" || "$new_limit" == "unlimited" ]]; then
+        BWLIMIT=""
+        log_success "Bandwidth limit removed"
+    else
+        BWLIMIT="$new_limit"
+        log_success "Bandwidth limit set to: $BWLIMIT"
+    fi
+
+    save_config
+
+    if is_mounted; then
+        log_warning "Restart mount for changes to take effect"
+        read -r -p "Restart now? [y/N] " confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] && restart_drive
+    fi
+}
+
+# ── Unmount ─────────────────────────────────────────────────────────────────────
+force_unmount() {
+    local fuse_bin
+    fuse_bin=$(fusermount_bin)
+
+    if [[ -n "$(rclone_pid)" ]]; then
+        echo -ne "  ${DIM}Stopping rclone process...${NC}  "
+        pkill -f "rclone mount.*$MOUNT_PATH" 2>/dev/null; sleep 1
+        echo -e "${GREEN}✓${NC}"
+    fi
+
+    if is_mounted && [[ -n "$fuse_bin" ]]; then
+        echo -ne "  ${DIM}Unmounting filesystem...${NC}    "
+        "$fuse_bin" -uz "$MOUNT_PATH" 2>/dev/null; sleep 1
+        echo -e "${GREEN}✓${NC}"
+    fi
+
+    if is_mounted; then
+        echo -ne "  ${DIM}Force unmounting...${NC}         "
+        sudo umount -l "$MOUNT_PATH" 2>/dev/null; sleep 1
+        echo -e "${GREEN}✓${NC}"
+    fi
+
+    if ! is_mounted; then
+        log_success "Successfully unmounted"
+        return 0
+    else
+        log_error "Failed to unmount"
+        return 1
+    fi
+}
+
+unmount_drive() {
+    if ! is_mounted; then
+        echo -e "${MAGENTA}Not currently mounted${NC}"
+        return 0
+    fi
+    box "$MAGENTA" "Unmounting Drive"
+    force_unmount
+}
+
+# ── Mount ───────────────────────────────────────────────────────────────────────
+mount_drive() {
+    clean_stale_mount
+    mkdir -p "$MOUNT_PATH"
+
+    if is_mounted; then
+        echo -e "${CYAN}Already mounted at $MOUNT_PATH${NC}"
+        return 0
+    fi
+
+    pkill -f "rclone mount.*$MOUNT_PATH" 2>/dev/null; sleep 1
+
+    box "$MAGENTA" "Starting Rclone Mount"
+
+    # FUSE allow_other
+    local allow_other=""
+    if grep -qE "^[[:space:]]*user_allow_other" /etc/fuse.conf 2>/dev/null; then
+        allow_other="--allow-other"
+        echo -e "  ${DIM}FUSE:${NC}      ${GREEN}allow_other enabled${NC}"
+    else
+        echo -e "  ${DIM}FUSE:${NC}      ${YELLOW}allow_other disabled${NC}"
+    fi
+
+    # Bandwidth
+    local bwlimit_opt=""
+    if [[ -n "$BWLIMIT" ]]; then
+        bwlimit_opt="--bwlimit $BWLIMIT"
+        echo -e "  ${DIM}Bandwidth:${NC} ${WHITE}${BWLIMIT}${NC}"
+    else
+        echo -e "  ${DIM}Bandwidth:${NC} ${WHITE}unlimited${NC}"
+    fi
+
+    rotate_logs
+    echo
+    echo -ne "  ${DIM}Initiating mount...${NC} "
+
+    # shellcheck disable=SC2086
+    rclone mount "$REMOTE":"$REMOTE_PATH" "$MOUNT_PATH" \
+        --daemon \
+        --vfs-cache-mode full \
+        --vfs-cache-max-size 20G \
+        --vfs-cache-max-age 72h \
+        --vfs-read-ahead 2G \
+        --vfs-read-chunk-size 64M \
+        --vfs-read-chunk-size-limit 512M \
+        --buffer-size 128M \
+        --dir-cache-time 1000h \
+        --poll-interval 60s \
+        --timeout 1h \
+        --umask 002 \
+        --transfers 8 \
+        --checkers 8 \
+        --drive-chunk-size 64M \
+        --allow-non-empty \
+        $allow_other \
+        $bwlimit_opt \
+        --log-level INFO \
+        --log-file "$LOG_FILE" \
+        2>&1
+
+    local exit_code=$?
+    if (( exit_code != 0 )); then
+        echo -e "${RED}✗${NC}"
+        log_error "rclone exited with code $exit_code"
+        echo -e "${CYAN}Check logs: rcmnt --logs --errors${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}✓${NC}"
+
+    # Wait for mount
+    local attempt=0
+    while (( attempt < MAX_RETRIES )); do
+        echo -ne "  ${YELLOW}Attempt $((attempt + 1))/$MAX_RETRIES...${NC} "
+        sleep 3
+
+        if is_mounted; then
+            echo -e "${GREEN}mounted${NC}"
+            echo -ne "  ${DIM}Verifying access...${NC} "
+            if timeout 10 ls "$MOUNT_PATH" &>/dev/null; then
+                echo -e "${GREEN}✓${NC}"
+                echo
+                result_box true "Successfully mounted"
+                echo -e "  ${DIM}Path:${NC} ${WHITE}$MOUNT_PATH${NC}"
+                return 0
+            else
+                echo -e "${YELLOW}waiting for remote...${NC}"
+            fi
+        else
+            echo -e "${DIM}waiting...${NC}"
+        fi
+        (( attempt++ ))
+    done
+
+    echo
+    result_box false "Mount failed"
+    echo -e "${CYAN}Check logs: rcmnt --logs --errors${NC}"
+    pkill -f "rclone mount.*$MOUNT_PATH" 2>/dev/null
+    return 1
+}
+
+# ── Restart ─────────────────────────────────────────────────────────────────────
+restart_drive() {
+    box "$MAGENTA" "Restarting Mount"
+    unmount_drive
+    sleep 2
+    mount_drive
+}
+
+# ── Status ──────────────────────────────────────────────────────────────────────
+show_status() {
+    $TERMINAL && clear
+
+    echo -e "  ${BOLD}${CYAN}════════════════════════════════════════════════${NC}"
+    echo -e "  ${BOLD}${CYAN}           RCLONE MOUNT STATUS                  ${NC}"
+    echo -e "  ${BOLD}${CYAN}════════════════════════════════════════════════${NC}"
+    echo
+
+    # Mount / process / network
+    local mount_status process_status network_status pid uptime=""
+    if is_mounted; then
+        mount_status="${GREEN}● MOUNTED${NC}"
+    else
+        mount_status="${RED}○ NOT MOUNTED${NC}"
+    fi
+
+    pid=$(rclone_pid)
+    if [[ -n "$pid" ]]; then
+        uptime=$(ps -p "$pid" -o etime= 2>/dev/null | xargs)
+        process_status="${GREEN}● RUNNING${NC} ${DIM}(PID: $pid)${NC}"
+    else
+        process_status="${RED}○ NOT RUNNING${NC}"
+    fi
+
+    echo -ne "  ${DIM}Checking network...${NC} "
+    if timeout 5 rclone about "$REMOTE:" &>/dev/null; then
+        network_status="${GREEN}● CONNECTED${NC}"
+        echo -e "\r${GREEN}✓ Network check${NC}                    "
+    else
+        network_status="${RED}○ DISCONNECTED${NC}"
+        echo -e "\r${RED}✗ Network check${NC}                    "
+    fi
+
+    # Cache
+    local cache_size_hr="0B" cache_files="0"
+    if [[ -d "$CACHE_DIR" ]]; then
+        local cache_raw
+        cache_raw=$(du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
+        cache_size_hr=$(format_bytes "${cache_raw:-0}")
+        cache_files=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l)
+    fi
+
+    echo
+    echo -e "  ${YELLOW}┌─ STATUS ──────────────────────────────────────┐${NC}"
+    echo -e "  ${YELLOW}│${NC} Mount:    ${mount_status}"
+    echo -e "  ${YELLOW}│${NC} Process:  ${process_status}"
+    [[ -n "$uptime" ]] && echo -e "  ${YELLOW}│${NC} Uptime:   ${DIM}${uptime}${NC}"
+    echo -e "  ${YELLOW}│${NC} Network:  ${network_status}"
+    echo -e "  ${YELLOW}└───────────────────────────────────────────────┘${NC}"
+
+    echo
+    echo -e "  ${YELLOW}┌─ CONFIGURATION ───────────────────────────────┐${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Remote:${NC}      ${WHITE}${REMOTE}:${REMOTE_PATH}${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Mount:${NC}       ${WHITE}${MOUNT_PATH}${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Log:${NC}         ${DIM}${LOG_FILE}${NC}"
+    [[ -n "$BWLIMIT" ]] && echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Bandwidth:${NC}   ${WHITE}${BWLIMIT}${NC}"
+    echo -e "  ${YELLOW}└───────────────────────────────────────────────┘${NC}"
+
+    echo
+    echo -e "  ${YELLOW}┌─ CACHE ────────────────────────────────────────┐${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Size:${NC}        ${WHITE}${cache_size_hr}${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Files:${NC}       ${WHITE}${cache_files}${NC}"
+    echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Location:${NC}    ${DIM}${CACHE_DIR}${NC}"
+    echo -e "  ${YELLOW}└───────────────────────────────────────────────┘${NC}"
+
+    if is_mounted; then
+        local mount_info size used available use_pct
+        mount_info=$(df -h "$MOUNT_PATH" 2>/dev/null | tail -1)
+        size=$(awk '{print $2}' <<< "$mount_info")
+        used=$(awk '{print $3}' <<< "$mount_info")
+        available=$(awk '{print $4}' <<< "$mount_info")
+        use_pct=$(awk '{print $5}' <<< "$mount_info")
+
+        echo
+        echo -e "  ${YELLOW}┌─ STORAGE ──────────────────────────────────────┐${NC}"
+        echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Total:${NC}       ${WHITE}${size}${NC}"
+        echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Used:${NC}        ${WHITE}${used}${NC} ${DIM}(${use_pct})${NC}"
+        echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Available:${NC}   ${WHITE}${available}${NC}"
+        echo -e "  ${YELLOW}└───────────────────────────────────────────────┘${NC}"
+    fi
+
+    echo
+}
+
+# ── Resource Monitor ────────────────────────────────────────────────────────────
+monitor_resources() {
+    if ! is_mounted; then
+        log_error "Mount not active"
+        return 1
+    fi
+
+    echo -e "${CYAN}Starting resource monitor (Ctrl+C to exit)...${NC}"
+    sleep 2
+
+    while true; do
+        show_status
+
+        local pid cpu mem threads
+        pid=$(rclone_pid)
+        if [[ -n "$pid" ]]; then
+            read -r cpu mem <<< "$(ps -p "$pid" -o %cpu,%mem --no-headers)"
+            threads=$(ps -p "$pid" -o nlwp --no-headers | xargs)
+
+            echo -e "  ${YELLOW}┌─ RESOURCE USAGE ──────────────────────────────┐${NC}"
+            echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}CPU:${NC}         ${WHITE}${cpu}%${NC}"
+            echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Memory:${NC}      ${WHITE}${mem}%${NC}"
+            echo -e "  ${YELLOW}│${NC} ${BOLD}${MAGENTA}Threads:${NC}     ${WHITE}${threads}${NC}"
+            echo -e "  ${YELLOW}└───────────────────────────────────────────────┘${NC}"
+        fi
+
+        echo
+        echo -e "${DIM}Refreshing in 5 seconds...${NC}"
+        sleep 5
+    done
+}
+
+# ── Systemd Service ─────────────────────────────────────────────────────────────
+install_service() {
+    local service_dir="$HOME/.config/systemd/user"
+    local service_file="$service_dir/rclone-${REMOTE}.service"
+    local fuse_bin
+
+    fuse_bin=$(fusermount_bin) || die "Neither fusermount3 nor fusermount found"
+
+    box "$MAGENTA" "Installing Systemd Service"
+    mkdir -p "$service_dir"
+
+    cat > "$service_file" << EOF
+[Unit]
+Description=Rclone Mount for $REMOTE
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c '$fuse_bin -uz $MOUNT_PATH 2>/dev/null; /usr/bin/mkdir -p $MOUNT_PATH'
+ExecStart=/usr/bin/rclone mount $REMOTE:$REMOTE_PATH $MOUNT_PATH \\
+    --vfs-cache-mode full \\
+    --vfs-cache-max-size 20G \\
+    --vfs-cache-max-age 72h \\
+    --vfs-read-ahead 2G \\
+    --vfs-read-chunk-size 64M \\
+    --vfs-read-chunk-size-limit 512M \\
+    --buffer-size 128M \\
+    --dir-cache-time 1000h \\
+    --poll-interval 60s \\
+    --timeout 1h \\
+    --umask 002 \\
+    --transfers 8 \\
+    --checkers 8 \\
+    --drive-chunk-size 64M \\
+    --allow-non-empty \\
+    --log-file $LOG_FILE \\
+    --log-level INFO
+ExecStop=$fuse_bin -uz $MOUNT_PATH
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+
+    log_success "Service file created: $service_file"
+    echo
+    echo -e "${CYAN}Enable auto-start:${NC}  ${WHITE}systemctl --user enable rclone-${REMOTE}.service${NC}"
+    echo -e "${CYAN}Start now:${NC}          ${WHITE}systemctl --user start rclone-${REMOTE}.service${NC}"
+    echo -e "${CYAN}Check status:${NC}       ${WHITE}systemctl --user status rclone-${REMOTE}.service${NC}"
+}
+
+uninstall_service() {
+    local service_dir="$HOME/.config/systemd/user"
+    local service_name="rclone-${REMOTE}.service"
+    local service_file="$service_dir/$service_name"
+
+    box "$MAGENTA" "Uninstalling Systemd Service"
+
+    if [[ ! -f "$service_file" ]]; then
+        log_warning "Service file not found: $service_file"
+        return 0
+    fi
+
+    echo -ne "  ${DIM}Stopping service...${NC}   "
+    systemctl --user stop "$service_name" 2>/dev/null; echo -e "${GREEN}✓${NC}"
+
+    echo -ne "  ${DIM}Disabling service...${NC}  "
+    systemctl --user disable "$service_name" 2>/dev/null; echo -e "${GREEN}✓${NC}"
+
+    echo -ne "  ${DIM}Removing file...${NC}      "
+    rm -f "$service_file"; echo -e "${GREEN}✓${NC}"
+
+    systemctl --user daemon-reload
+    systemctl --user reset-failed "$service_name" 2>/dev/null
+
+    echo
+    log_success "Service uninstalled: $service_name"
+}
+
+# ── Interactive Menu ────────────────────────────────────────────────────────────
+interactive_menu() {
+    while true; do
+        show_status
+
+        echo -e "  ${BOLD}${CYAN}┌──────────────────────────────────────────────┐${NC}"
+        echo -e "  ${BOLD}${CYAN}│              RCLONE CONTROLS                  │${NC}"
+        echo -e "  ${BOLD}${CYAN}├──────────────────────────────────────────────┤${NC}"
+        echo -e "  ${BOLD}${CYAN}│${NC}  ${GREEN}[M]${NC}ount       ${YELLOW}[U]${NC}nmount      ${CYAN}[R]${NC}estart      ${BOLD}${CYAN}│${NC}"
+        echo -e "  ${BOLD}${CYAN}│${NC}  ${MAGENTA}[S]${NC}tatus      ${WHITE}[W]${NC}atch        ${DIM}[H]${NC}ealth       ${BOLD}${CYAN}│${NC}"
+        echo -e "  ${BOLD}${CYAN}│${NC}  ${DIM}[C]${NC}lean Cache ${DIM}[L]${NC}ogs         ${RED}[Q]${NC}uit         ${BOLD}${CYAN}│${NC}"
+        echo -e "  ${BOLD}${CYAN}└──────────────────────────────────────────────┘${NC}"
+        echo
+        echo -ne "  ${YELLOW}➜ Select an option: ${NC}"
+        read -r -s -n1 choice
+        echo; echo
+
+        case "${choice,,}" in
+            m) mount_drive ;;
+            u) unmount_drive ;;
+            r) restart_drive ;;
+            s) ;; # status refreshes at top of loop
+            w) monitor_resources ;;
+            h) check_health ;;
+            c) clean_cache ;;
+            l)
+                echo -e "${CYAN}Log Options:${NC}"
+                echo -e "  ${WHITE}[1]${NC} Last 50 lines"
+                echo -e "  ${WHITE}[2]${NC} Errors only"
+                echo -e "  ${WHITE}[3]${NC} Follow live"
+                echo -ne "\n${YELLOW}➜ Select: ${NC}"
+                read -r -s -n1 log_choice; echo
+                case "$log_choice" in
+                    1) view_logs tail 50 ;;
+                    2) view_logs --errors 50 ;;
+                    3) view_logs --tail 50 ;;
+                    *) log_warning "Invalid choice" ;;
+                esac
+                ;;
+            q) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) log_error "Invalid choice" ;;
+        esac
+
+        if [[ "${choice,,}" != "s" ]]; then
+            echo; press_any_key
+        else
+            sleep 1
+        fi
+    done
+}
+
+# ── Help ────────────────────────────────────────────────────────────────────────
+show_help() {
+    show_header "rcmnt v1.4.0"
+
+    echo -e "${CYAN}Usage:${NC} ${WHITE}rcmnt [OPTION]${NC}"
+    echo
+
+    show_section "Mount Operations"
+    echo "  -m, --mount              Mount the remote drive"
+    echo "  -u, --unmount            Unmount the remote drive"
+    echo "  -r, --restart            Restart the mount"
+    echo "  -s, --status             Show detailed status"
+    echo
+
+    show_section "Monitoring"
+    echo "  -w, --watch              Monitor resources in real-time"
+    echo "  -c, --health             Run health check"
+    echo "  -l, --logs [MODE] [N]    View logs"
+    echo "       Modes: --tail/-t (follow), --errors/-e, --full"
+    echo "       Example: rcmnt --logs --errors 100"
+    echo
+
+    show_section "Maintenance"
+    echo "  --clean-cache, --cc      Clean old cache files"
+    echo "  --rotate-logs            Manually rotate log files"
+    echo "  --save-config            Save current configuration"
+    echo "  --bwlimit [SPEED]        Set bandwidth limit (10M, 512K, off)"
+    echo
+
+    show_section "Service"
+    echo "  --install-service        Install systemd user service"
+    echo "  --uninstall-service      Remove systemd user service"
+    echo
+
+    show_section "General"
+    echo "  --menu                   Launch interactive menu (default)"
+    echo "  -h, --help               Show this help"
+    echo "  -v, --version            Show version"
+    echo
+
+    show_section "Current Configuration"
+    echo "  Remote:      ${REMOTE}:${REMOTE_PATH}"
+    echo "  Mount Path:  ${MOUNT_PATH}"
+    echo "  Log File:    ${LOG_FILE}"
+    echo "  Cache Dir:   ${CACHE_DIR}"
+    [[ -n "$BWLIMIT" ]] && echo "  Bandwidth:   ${BWLIMIT}"
+    echo
+
+    show_section "Examples"
+    echo "  rcmnt --mount"
+    echo "  rcmnt --status"
+    echo "  rcmnt --health"
+    echo "  rcmnt --logs --errors"
+    echo "  rcmnt --bwlimit 10M"
+    echo "  rcmnt --menu"
+}
+
+# ── Initialise ──────────────────────────────────────────────────────────────────
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$CONFIG_FILE")"
+load_config
+
+# ── Argument Parsing ────────────────────────────────────────────────────────────
+case "${1:-}" in
+    -m|--mount)              mount_drive ;;
+    -u|--unmount)            unmount_drive ;;
+    -s|--status)             show_status ;;
+    -r|--restart)            restart_drive ;;
+    -c|--health|--check)     check_health ;;
+    --clean-cache|--cc)      clean_cache ;;
+    --rotate-logs)           rotate_logs ;;
+    --save-config)           save_config ;;
+    --install-service|--service-install)     install_service ;;
+    --uninstall-service|--service-uninstall) uninstall_service ;;
+    -w|--watch|--monitor)    monitor_resources ;;
+    --menu|--interactive|"") interactive_menu ;;
+    -h|--help)               show_help ;;
+    -v|--version)            echo "rcmnt v1.4.0" ;;
+
+    --bwlimit|--bw)
+        [[ $# -ge 2 ]] || die "--bwlimit requires an argument (e.g. 10M, off)"
+        set_bandwidth "$2"
+        ;;
+
+    -l|--logs)
+        shift
+        mode="tail"; lines="50"
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --tail|-t|--follow) mode="--tail" ;;
+                --errors|-e)        mode="--errors" ;;
+                --full)             mode="--full" ;;
+                [0-9]*)             lines="$1" ;;
+                *)                  break ;;
+            esac
+            shift
+        done
+        view_logs "$mode" "$lines"
+        ;;
+
+    *)
+        log_error "Unknown option: $1"
+        echo "Try 'rcmnt --help' for more information."
+        exit 1
+        ;;
+esac
