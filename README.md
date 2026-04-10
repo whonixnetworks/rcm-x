@@ -43,6 +43,10 @@ Available commands after installation:
 - Logging to both systemd journal and dedicated log files
 - Shell alias installation for easy access
 
+### Documentation
+
+For detailed technical documentation including architecture, operating modes, and troubleshooting, see [DOCS.md](DOCS.md).
+
 ----
 
 ## rcmv/rcmv
