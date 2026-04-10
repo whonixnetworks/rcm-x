@@ -66,7 +66,7 @@ sudo_run() {
         "$@"
     else
         echo -e "${YELLOW}  ⚠${NC}  Elevated access required for: ${WHITE}${desc}${NC}"
-        sudo "$@"
+        sudo -n "$@" 2>/dev/null || sudo "$@"
     fi
 }
 
@@ -159,6 +159,48 @@ apt_checks() {
     fi
 
     success "All preflight checks passed."
+}
+
+# ── Timeout wrapper for mountpoint ───────────────────────────
+# FUSE mounts can hang if the filesystem is stuck, so we need a timeout
+mountpoint_with_timeout() {
+  local dir="$1"
+  local timeout_sec="${2:-3}"  # Reduced from 5s to fail faster
+  
+  # Use a subshell with timeout to prevent hangs
+  if timeout "$timeout_sec" bash -c "mountpoint -q \"$dir\" 2>/dev/null"; then
+    return 0
+  else
+    # Check if timeout was due to mount being stuck or just not mounted
+    local exit_code=$?
+    if [[ $exit_code -eq 124 ]]; then
+      # Timeout occurred - mount is stuck/unresponsive
+      warn "mountpoint check timed out after ${timeout_sec}s (FUSE mount may be stuck)"
+      return 1
+    else
+      # mountpoint returned non-zero - directory is not a mount point
+      return 1
+    fi
+  fi
+}
+
+# ── Check mount via /proc/mounts (doesn't hang on stuck FUSE) ─
+check_mount_in_proc() {
+  local dir="$1"
+  local normalized_dir
+  normalized_dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
+  
+  # Check /proc/mounts directly - this doesn't hang on stuck FUSE
+  if grep -q " $normalized_dir " /proc/mounts 2>/dev/null; then
+    return 0
+  fi
+  
+  # Also check with trailing slash
+  if grep -q " $normalized_dir/ " /proc/mounts 2>/dev/null; then
+    return 0
+  fi
+  
+  return 1
 }
 
 # ── Read a directory path with a prefilled default ───────────
@@ -363,11 +405,55 @@ get_user_ids() {
     USER_GID=$(id -g "$WHOAMI")
 }
 
+# ── Check for potential mount conflicts ──────────────────────
+check_mount_conflicts() {
+  section "Checking Mount Conflicts"
+  
+  # Check if merged directory or its parents/children are already mounted
+  if mountpoint_with_timeout "$MERGED_DIR" 3; then
+    warn "Directory $MERGED_DIR is already a mount point"
+    dim "This may cause issues with the new mergerfs mount."
+    read -rp "Continue anyway? [y/N]: " ans
+    ans="${ans:-N}"
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+      die "Aborted due to mount conflict."
+    fi
+  fi
+  
+  # Check if remote mount directory is already mounted
+  if mountpoint_with_timeout "$REMOTE_MOUNT_DIR" 3; then
+    warn "Directory $REMOTE_MOUNT_DIR is already a mount point"
+    dim "This may cause issues with the new rclone mount."
+    read -rp "Continue anyway? [y/N]: " ans
+    ans="${ans:-N}"
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+      die "Aborted due to mount conflict."
+    fi
+  fi
+  
+  # Check if any child directory of merged directory is already mounted
+  # This prevents mounting at parent when child is already a mount point
+  local child_mount
+  child_mount=$(grep " $MERGED_DIR/" /proc/mounts 2>/dev/null | head -1 | cut -d' ' -f2)
+  if [[ -n "$child_mount" ]]; then
+    error "Cannot mount at $MERGED_DIR because child directory is already mounted:"
+    error "  $child_mount"
+    dim "FUSE cannot mount at a parent directory when a child directory is already mounted."
+    dim "Either:"
+    dim "  1. Choose a different working directory"
+    dim "  2. Unmount the existing mount at: $child_mount"
+    dim "  3. Use a subdirectory (e.g., $MERGED_DIR/newmount) instead of the root"
+    die "Mount conflict with existing child mount."
+  fi
+  
+  success "No mount conflicts detected"
+}
+
 # ── Create directories ───────────────────────────────────────
 create_dirs() {
-    section "Creating Directories"
+  section "Creating Directories"
 
-    local dirs=("$MERGED_DIR" "$LOCAL_DIR" "$REMOTE_MOUNT_DIR" "$LOG_DIR")
+  local dirs=("$MERGED_DIR" "$LOCAL_DIR" "$REMOTE_MOUNT_DIR" "$LOG_DIR")
 
     for dir in "${dirs[@]}"; do
         if [[ -d "$dir" ]]; then
@@ -393,15 +479,22 @@ create_dirs() {
 
 # ── Write rclone service ─────────────────────────────────────
 write_rclone_service() {
-    section "Writing rclone Systemd Service"
+  section "Writing rclone Systemd Service"
 
-    local remote_full="${REMOTE}${REMOTE_PATH}"
-    local service_path="${SYSTEMD_DIR}/${RCLONE_SERVICE_FILE}"
+  local remote_full="${REMOTE}${REMOTE_PATH}"
+  local service_path="${SYSTEMD_DIR}/${RCLONE_SERVICE_FILE}"
 
-    # Use a single continuous line for ExecStart - systemd does NOT handle
-    # backslash continuations properly in service files
-    local tmpfile
-    tmpfile=$(mktemp)
+  # Detect fusermount path (could be in /usr/bin or /bin)
+  local fusermount_path
+  fusermount_path=$(command -v fusermount3 || command -v fusermount)
+  if [[ -z "$fusermount_path" ]]; then
+    die "fusermount not found. Is fuse/fuse3 installed?"
+  fi
+
+  # Use a single continuous line for ExecStart - systemd does NOT handle
+  # backslash continuations properly in service files
+  local tmpfile
+  tmpfile=$(mktemp)
 
     cat > "$tmpfile" <<SVCEOF
 [Unit]
@@ -412,8 +505,10 @@ AssertPathIsDirectory=${REMOTE_MOUNT_DIR}
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/rclone mount ${remote_full} ${REMOTE_MOUNT_DIR} --config=${RCLONE_CONF} --vfs-cache-mode=full --vfs-cache-max-size=${VFS_CACHE_SIZE} --vfs-cache-max-age=24h --vfs-read-chunk-size=128M --vfs-read-chunk-size-limit=off --dir-cache-time=72h --poll-interval=15s --transfers=${TRANSFERS} --allow-other --umask=002 --uid=${USER_UID} --gid=${USER_GID} --log-level=NOTICE --log-file=${RCLONE_LOG_FILE}
-ExecStop=/bin/fusermount -uz ${REMOTE_MOUNT_DIR}
+TimeoutStartSec=60
+TimeoutStopSec=30
+ExecStart=/usr/bin/rclone mount ${remote_full} ${REMOTE_MOUNT_DIR} --config=${RCLONE_CONF} --vfs-cache-mode=full --vfs-cache-max-size=${VFS_CACHE_SIZE} --vfs-cache-max-age=24h --vfs-read-chunk-size=128M --vfs-read-chunk-size-limit=off --dir-cache-time=72h --poll-interval=15s --transfers=${TRANSFERS} --async-read=false --allow-other --umask=002 --uid=${USER_UID} --gid=${USER_GID} --log-level=NOTICE --log-file=${RCLONE_LOG_FILE}
+ExecStop=${fusermount_path} -uz ${REMOTE_MOUNT_DIR}
 Restart=on-failure
 RestartSec=10
 User=${WHOAMI}
@@ -431,21 +526,27 @@ SVCEOF
 
 # ── Write mergerfs service ───────────────────────────────────
 write_mergerfs_service() {
-    section "Writing mergerfs Systemd Service"
+  section "Writing mergerfs Systemd Service"
 
-    local service_path="${SYSTEMD_DIR}/${MERGERFS_SERVICE_FILE}"
+  local service_path="${SYSTEMD_DIR}/${MERGERFS_SERVICE_FILE}"
 
-    local fusermount_bin="fusermount"
-    command -v fusermount3 &>/dev/null && fusermount_bin="fusermount3"
+  # Detect fusermount path (could be in /usr/bin or /bin)
+  local fusermount_path
+  fusermount_path=$(command -v fusermount3 || command -v fusermount)
+  if [[ -z "$fusermount_path" ]]; then
+    die "fusermount not found. Is fuse/fuse3 installed?"
+  fi
 
-    local tmpfile
-    tmpfile=$(mktemp)
+  local tmpfile
+  tmpfile=$(mktemp)
 
-    # Build mergerfs options - add 'nonempty' for merged-only mode since the
-    # merged directory contains the hidden .rcmx-* directory from rclone mount
+    # Build mergerfs options
     local mergerfs_opts="defaults,allow_other,use_ino"
+    
+    # In merged-only mode, the merged directory contains the hidden .rcmx-* directory
+    # We need to allow mounting on non-empty directories
     if [[ "$MERGED_ONLY" == "true" ]]; then
-        mergerfs_opts="${mergerfs_opts},nonempty"
+      mergerfs_opts="${mergerfs_opts},nonempty"
     fi
 
     cat > "$tmpfile" <<SVCEOF
@@ -458,8 +559,10 @@ AssertPathIsDirectory=${MERGED_DIR}
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+TimeoutStartSec=30
+TimeoutStopSec=15
 ExecStart=/usr/bin/mergerfs ${LOCAL_DIR}:${REMOTE_MOUNT_DIR} ${MERGED_DIR} -o ${mergerfs_opts} -o category.create=ff -o fsname=rcmx-${INSTANCE_NAME} -o minfreespace=10G -o umask=002
-ExecStop=/bin/${fusermount_bin} -uz ${MERGED_DIR}
+ExecStop=${fusermount_path} -uz ${MERGED_DIR}
 RemoveIPC=true
 
 [Install]
@@ -484,84 +587,202 @@ enable_services() {
     # Enable the service first
     sudo_run "enable rclone" systemctl enable "$RCLONE_SERVICE_FILE" 2>/dev/null
     
-    # Start and verify rclone service
-    if sudo_run "start rclone" systemctl start "$RCLONE_SERVICE_FILE"; then
-        sleep 3
-        if systemctl is-active --quiet "$RCLONE_SERVICE_FILE"; then
-            success "rclone service active"
-        else
-            echo ""
-            error "rclone service failed to start."
-            echo ""
-            dim "Service status:"
-            sudo systemctl status "$RCLONE_SERVICE_FILE" --no-pager -l 2>/dev/null || true
-            echo ""
-            dim "Check logs with: sudo journalctl -xeu $RCLONE_SERVICE_FILE"
-            dim "Common causes:"
-            dim "  - Remote name incorrect or not configured"
-            dim "  - Remote mount directory not accessible (check permissions)"
-            dim "  - rclone config missing or invalid"
-            dim "  - Network connectivity issues"
-            exit 1
-        fi
-    else
-        error "Failed to start rclone service"
-        exit 1
+  # Start and verify rclone service
+  if sudo_run "start rclone" systemctl start "$RCLONE_SERVICE_FILE"; then
+  # Wait for service to be active with retry logic
+  local rclone_ready="false"
+  local i
+  for ((i = 1; i <= 15; i++)); do
+    sleep 1
+    if systemctl is-active --quiet "$RCLONE_SERVICE_FILE"; then
+      rclone_ready="true"
+      break
     fi
+  done
 
-    # Verify rclone mount is actually mounted
-    sleep 2
-    if ! mountpoint -q "$REMOTE_MOUNT_DIR"; then
-        error "rclone mount not active after start: $REMOTE_MOUNT_DIR"
-        dim "Check rclone logs: sudo journalctl -xeu $RCLONE_SERVICE_FILE"
-        dim "Also check: cat $RCLONE_LOG_FILE"
-        exit 1
+    if [[ "$rclone_ready" == "true" ]]; then
+      success "rclone service active"
+    else
+      echo ""
+      error "rclone service failed to start."
+      echo ""
+      dim "Service status:"
+      sudo systemctl status "$RCLONE_SERVICE_FILE" --no-pager -l 2>/dev/null || true
+      echo ""
+      dim "Check logs with: sudo journalctl -xeu $RCLONE_SERVICE_FILE"
+      dim "Common causes:"
+      dim " - Remote name incorrect or not configured"
+      dim " - Remote mount directory not accessible (check permissions)"
+      dim " - rclone config missing or invalid"
+      dim " - Network connectivity issues"
+      exit 1
     fi
+  else
+    error "Failed to start rclone service"
+    exit 1
+  fi
+
+  # Verify rclone mount is actually mounted with retry logic
+  local mount_ready="false"
+  local i
+  for ((i = 1; i <= 20; i++)); do
+    sleep 1
+    # Try /proc/mounts first (doesn't hang on stuck FUSE)
+    if check_mount_in_proc "$REMOTE_MOUNT_DIR"; then
+      mount_ready="true"
+      break
+    fi
+    # Fall back to mountpoint check
+    if mountpoint_with_timeout "$REMOTE_MOUNT_DIR" 3; then
+      mount_ready="true"
+      break
+    fi
+  done
+
+  if [[ "$mount_ready" == "true" ]]; then
     success "rclone mount verified at: $REMOTE_MOUNT_DIR"
+  else
+    error "rclone mount not active after start: $REMOTE_MOUNT_DIR"
+    dim "Check rclone logs: sudo journalctl -xeu $RCLONE_SERVICE_FILE"
+    dim "Also check: cat $RCLONE_LOG_FILE"
+    exit 1
+  fi
 
     log "Enabling and starting ${MERGERFS_SERVICE_FILE}..."
     
     # Enable the service
     sudo_run "enable mergerfs" systemctl enable "$MERGERFS_SERVICE_FILE" 2>/dev/null
     
-    # Start and verify mergerfs service
-    if sudo_run "start mergerfs" systemctl start "$MERGERFS_SERVICE_FILE"; then
-        sleep 2
-        if systemctl is-active --quiet "$MERGERFS_SERVICE_FILE"; then
-            success "mergerfs service active"
-        else
-            echo ""
-            error "mergerfs service failed to start."
-            echo ""
-            dim "Service status:"
-            sudo systemctl status "$MERGERFS_SERVICE_FILE" --no-pager -l 2>/dev/null || true
-            echo ""
-            dim "Check logs with: sudo journalctl -xeu $MERGERFS_SERVICE_FILE"
-            exit 1
-        fi
+  # Start and verify mergerfs service
+  if sudo_run "start mergerfs" systemctl start "$MERGERFS_SERVICE_FILE"; then
+    sleep 2
+    if systemctl is-active --quiet "$MERGERFS_SERVICE_FILE"; then
+      success "mergerfs service active"
     else
-        error "Failed to start mergerfs service"
-        exit 1
+      echo ""
+      error "mergerfs service failed to start."
+      echo ""
+      dim "Service status:"
+      sudo systemctl status "$MERGERFS_SERVICE_FILE" --no-pager -l 2>/dev/null || true
+      echo ""
+      dim "Check logs with: sudo journalctl -xeu $MERGERFS_SERVICE_FILE"
+      exit 1
     fi
+  else
+    error "Failed to start mergerfs service"
+    exit 1
+  fi
+
+  # Verify mergerfs mount is actually mounted with retry logic
+  local mergerfs_ready="false"
+  local i
+  for ((i = 1; i <= 8; i++)); do  # Reduced from 10 to fail faster
+    sleep 1
+    
+    # Try /proc/mounts first (doesn't hang on stuck FUSE)
+    if check_mount_in_proc "$MERGED_DIR"; then
+      mergerfs_ready="true"
+      break
+    fi
+    
+    # Fall back to mountpoint check (may hang on stuck FUSE)
+    if mountpoint_with_timeout "$MERGED_DIR" 3; then
+      mergerfs_ready="true"
+      break
+    fi
+  done
+
+  if [[ "$mergerfs_ready" == "true" ]]; then
+    success "mergerfs mount verified at: $MERGED_DIR"
+  else
+    error "mergerfs mount not active after start: $MERGED_DIR"
+    echo ""
+    dim "Debug information:"
+    dim "  Checking /proc/mounts: grep ' $MERGED_DIR' /proc/mounts"
+    grep " $MERGED_DIR" /proc/mounts 2>/dev/null || dim "    No match found"
+    dim "  Checking mount output: mount | grep -i mergerfs"
+    mount | grep -i mergerfs 2>/dev/null || dim "    No mergerfs mounts found"
+    dim "  Checking process list: ps aux | grep -i mergerfs"
+    ps aux | grep -i mergerfs 2>/dev/null | grep -v grep || dim "    No mergerfs processes found"
+    echo ""
+    dim "Troubleshooting steps:"
+    dim "  1. Check mergerfs logs: sudo journalctl -xeu $MERGERFS_SERVICE_FILE"
+    dim "  2. Check if mount is stuck: sudo fusermount -uz $MERGED_DIR"
+    dim "  3. Check directory permissions: ls -la $MERGED_DIR"
+    dim "  4. Check if rclone mount is working: ls $REMOTE_MOUNT_DIR"
+    exit 1
+  fi
 }
 # ── Verify mounts ────────────────────────────────────────────
 verify_mounts() {
-    section "Verifying Mounts"
-    local ok="true"
+  require_instance
 
-    if mountpoint -q "$REMOTE_MOUNT_DIR"; then
-        success "rclone mount active: $REMOTE_MOUNT_DIR"
-    else
-        error "rclone mount NOT active: $REMOTE_MOUNT_DIR"
-        ok="false"
-    fi
+  # Extract mount paths from service file Environment or ExecStop lines
+  # which are more reliable than parsing the ExecStart line with spaces
+  local rclone_stop_line mergerfs_stop_line
 
-    if mountpoint -q "$MERGED_DIR"; then
-        success "mergerfs mount active: $MERGED_DIR"
+  if [[ -f "${SYSTEMD_DIR}/${RCLONE_SERVICE_FILE}" ]]; then
+    # Extract mount point from ExecStop line: ExecStop=/path/to/fusermount -uz /mount/point
+    rclone_stop_line=$(grep '^ExecStop=' "${SYSTEMD_DIR}/${RCLONE_SERVICE_FILE}" 2>/dev/null | tail -1)
+  fi
+  if [[ -f "${SYSTEMD_DIR}/${MERGERFS_SERVICE_FILE}" ]]; then
+    mergerfs_stop_line=$(grep '^ExecStop=' "${SYSTEMD_DIR}/${MERGERFS_SERVICE_FILE}" 2>/dev/null | tail -1)
+  fi
+
+  # Extract the last argument (mount point) from ExecStop lines
+  # Format: ExecStop=/path/fusermount -uz /mount/point
+  REMOTE_MOUNT_DIR=""
+  MERGED_DIR=""
+
+  if [[ -n "$rclone_stop_line" ]]; then
+    # Remove everything up to and including "-uz " to get the mount point
+    REMOTE_MOUNT_DIR="${rclone_stop_line#*-uz }"
+    # Remove any trailing whitespace/comments
+    REMOTE_MOUNT_DIR="${REMOTE_MOUNT_DIR%%[[:space:]]*}"
+  fi
+
+  if [[ -n "$mergerfs_stop_line" ]]; then
+    MERGED_DIR="${mergerfs_stop_line#*-uz }"
+    MERGED_DIR="${MERGED_DIR%%[[:space:]]*}"
+  fi
+
+  if [[ -z "$REMOTE_MOUNT_DIR" || -z "$MERGED_DIR" ]]; then
+    error "Failed to extract mount paths from service files"
+    dim "rclone_stop_line: $rclone_stop_line"
+    dim "mergerfs_stop_line: $mergerfs_stop_line"
+    dim "REMOTE_MOUNT_DIR: $REMOTE_MOUNT_DIR"
+    dim "MERGED_DIR: $MERGED_DIR"
+    exit 1
+  fi
+
+  section "Verifying Mounts"
+  local ok="true"
+
+  # Use /proc/mounts check only (mountpoint can hang on stuck FUSE)
+  if check_mount_in_proc "$REMOTE_MOUNT_DIR"; then
+    success "rclone mount active: $REMOTE_MOUNT_DIR"
+  else
+    # Only try mountpoint as last resort with very short timeout
+    warn "Mount not found in /proc/mounts, trying mountpoint check..."
+    if timeout 2 mountpoint -q "$REMOTE_MOUNT_DIR" 2>/dev/null; then
+      success "rclone mount active: $REMOTE_MOUNT_DIR"
     else
-        error "mergerfs mount NOT active: $MERGED_DIR"
-        ok="false"
+      error "rclone mount NOT active: $REMOTE_MOUNT_DIR"
+      ok="false"
     fi
+  fi
+
+  if check_mount_in_proc "$MERGED_DIR"; then
+    success "mergerfs mount active: $MERGED_DIR"
+  else
+    warn "Mount not found in /proc/mounts, trying mountpoint check..."
+    if timeout 2 mountpoint -q "$MERGED_DIR" 2>/dev/null; then
+      success "mergerfs mount active: $MERGED_DIR"
+    else
+      error "mergerfs mount NOT active: $MERGED_DIR"
+      ok="false"
+    fi
+  fi
 
     if [[ "$ok" == "true" ]]; then
         echo ""
@@ -657,9 +878,27 @@ require_instance() {
         fi
     fi
 
-    RCLONE_SERVICE_FILE="rcmx-rclone-${INSTANCE_NAME}.service"
-    MERGERFS_SERVICE_FILE="rcmx-mergerfs-${INSTANCE_NAME}.service"
-    RCLONE_LOG_FILE="${LOG_DIR}/rclone-${INSTANCE_NAME}.log"
+  RCLONE_SERVICE_FILE="rcmx-rclone-${INSTANCE_NAME}.service"
+  MERGERFS_SERVICE_FILE="rcmx-mergerfs-${INSTANCE_NAME}.service"
+  RCLONE_LOG_FILE="${LOG_DIR}/rclone-${INSTANCE_NAME}.log"
+
+  # Extract mount directories from service files for use in other functions
+  local rclone_stop_line mergerfs_stop_line
+  rclone_stop_line=$(grep '^ExecStop=' "${SYSTEMD_DIR}/${RCLONE_SERVICE_FILE}" 2>/dev/null | tail -1)
+  mergerfs_stop_line=$(grep '^ExecStop=' "${SYSTEMD_DIR}/${MERGERFS_SERVICE_FILE}" 2>/dev/null | tail -1)
+
+  REMOTE_MOUNT_DIR=""
+  MERGED_DIR=""
+
+  if [[ -n "$rclone_stop_line" ]]; then
+    REMOTE_MOUNT_DIR="${rclone_stop_line#*-uz }"
+    REMOTE_MOUNT_DIR="${REMOTE_MOUNT_DIR%%[[:space:]]*}"
+  fi
+
+  if [[ -n "$mergerfs_stop_line" ]]; then
+    MERGED_DIR="${mergerfs_stop_line#*-uz }"
+    MERGED_DIR="${MERGED_DIR%%[[:space:]]*}"
+  fi
 }
 
 # ── Service control ───────────────────────────────────────────
@@ -695,9 +934,39 @@ do_stop() {
 }
 
 do_restart() {
-    do_stop
-    sleep 2
-    do_start
+  do_stop
+
+  # Wait for mounts to actually unmount before starting again
+  # Prevents race conditions where start tries to mount over an unclean state
+  local wait_count=0
+  local max_wait=30
+
+  while [[ $wait_count -lt $max_wait ]]; do
+    local both_unmounted="true"
+
+    # Use timeout wrapper to prevent hangs on stuck FUSE mounts
+    if timeout 3 mountpoint -q "$MERGED_DIR" 2>/dev/null; then
+      both_unmounted="false"
+    fi
+
+    if timeout 3 mountpoint -q "$REMOTE_MOUNT_DIR" 2>/dev/null; then
+      both_unmounted="false"
+    fi
+
+    if [[ "$both_unmounted" == "true" ]]; then
+      break
+    fi
+
+    sleep 1
+    ((wait_count++)) || true
+  done
+
+  if [[ $wait_count -ge $max_wait ]]; then
+    warn "Mounts did not unmount cleanly after ${max_wait}s"
+    dim "You may need to manually check: mount | grep rclone"
+  fi
+
+  do_start
 }
 
 do_logs() {
@@ -741,10 +1010,17 @@ show_status() {
             echo -e "    mergerfs: ${RED}○ inactive${NC}"
         fi
 
-        local mount_point
-        mount_point=$(grep -oP '(?<=-uz )\S+' "${SYSTEMD_DIR}/${mergerfs_svc}" 2>/dev/null \
-            | head -1 || echo "unknown")
-        echo -e "    mount   : ${GRAY}${mount_point}${NC}"
+    local mount_point
+    local stop_line
+    stop_line=$(grep '^ExecStop=' "${SYSTEMD_DIR}/${mergerfs_svc}" 2>/dev/null | tail -1)
+    if [[ -n "$stop_line" ]]; then
+      # Extract mount point from "ExecStop=/path/fusermount -uz /mount/point"
+      mount_point="${stop_line#*-uz }"
+      mount_point="${mount_point%%[[:space:]]*}"
+    else
+      mount_point="unknown"
+    fi
+    echo -e " mount : ${GRAY}${mount_point}${NC}"
 
         local log_file="${LOG_DIR}/rclone-${name}.log"
         if [[ -f "$log_file" ]]; then
@@ -836,11 +1112,12 @@ main() {
             apt_checks
             rcmx_config
             get_user_ids
+            check_mount_conflicts
             create_dirs
             write_rclone_service
             write_mergerfs_service
             enable_services
-            verify_mounts
+            # verify_mounts is redundant here - mounts already verified in enable_services
             install_rcmx_command
             section "Setup Complete"
             success "RCM-X instance '${INSTANCE_NAME}' is live."
